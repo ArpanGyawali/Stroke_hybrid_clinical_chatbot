@@ -11,9 +11,11 @@ from pathlib import Path
 import streamlit as st
 import pandas as pd
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline, StoppingCriteria, StoppingCriteriaList
 from langchain_community.llms import Ollama, HuggingFacePipeline
 from langsmith import Client as LangSmithClient
+from sentence_transformers import SentenceTransformer
+
 
 from .config.settings import settings
 from .agents.primary_agent import PrimaryAgent
@@ -26,29 +28,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Disable LangSmith to avoid warnings
-os.environ["LANGCHAIN_TRACING_V2"] = "false"
-
-# class OpenAILLM:
-#     def __init__(self, api_key, model, max_tokens=256, temperature=0.1, top_p=0.9):
-#         openai.api_key = api_key
-#         self.model = model
-#         self.max_tokens = max_tokens
-#         self.temperature = temperature
-#         self.top_p = top_p
-
-#     def generate(self, prompt):
-#         response = openai.ChatCompletion.create(
-#             model=self.model,
-#             messages=[{"role": "user", "content": prompt}],
-#             max_tokens=self.max_tokens,
-#             temperature=self.temperature,
-#             top_p=self.top_p,
-#         )
-#         return response.choices[0].message.content
-
-#     def __call__(self, prompt):
-#         return self.generate(prompt)
+class CustomStoppingCriteria(StoppingCriteria):
+    def __init__(self, stop_words, tokenizer):
+        self.stop_words = stop_words
+        self.tokenizer = tokenizer
+        
+    def __call__(self, input_ids, scores, **kwargs):
+        # Decode the last few tokens to check for stop words
+        last_tokens = self.tokenizer.decode(input_ids[0][-20:])
+        for stop_word in self.stop_words:
+            if stop_word in last_tokens:
+                return True
+        return False
 
 @st.cache_resource
 def initialize_llm():
@@ -64,9 +55,13 @@ def initialize_llm():
         model = AutoModelForCausalLM.from_pretrained(
             str(model_path),
             torch_dtype=torch.float16,
-            device_map="auto",
-            load_in_4bit=True   # Saves VRAM, optional
+            device_map="auto"
+            # load_in_4bit=True   # Saves VRAM, optional
         )
+
+        # Create stopping criteria
+        stop_words = ["</CODE>", "</RESPONSE>"]
+        stopping_criteria = StoppingCriteriaList([CustomStoppingCriteria(stop_words, tokenizer)])
 
         pipe = pipeline(
             "text-generation",
@@ -74,8 +69,13 @@ def initialize_llm():
             tokenizer=tokenizer,
             max_new_tokens=settings.max_tokens,
             temperature=settings.temperature,
-            top_p=0.9
+            top_p=0.9,
+            pad_token_id=tokenizer.eos_token_id,
+            stopping_criteria=stopping_criteria,
+            return_full_text=False,  # Critical: only return new tokens
+            repetition_penalty=1.1   # Prevent repetition
         )
+
         pipe2 = pipeline(
             "question-answering",
             model=model,
@@ -94,8 +94,9 @@ def initialize_llm():
         #     temperature=settings.temperature,
         #     top_p=0.9,
         # )
-        logger.info(f"LLM initialized successfully: {settings.llm_model}")
-        return llm, llm2
+        embedding_model = SentenceTransformer(settings.embedding_model)
+        logger.info(f"LLM and embedding model nitialized successfully: {settings.llm_model} {settings.embedding_model}")
+        return llm, llm2, embedding_model
         
     except Exception as e:
         logger.error(f"Failed to initialize LLM: {e}")
@@ -120,11 +121,11 @@ def _initialize_langsmith() -> None:
             logger.warning(f"Failed to initialize LangSmith: {e}")
 
 @st.cache_resource
-def get_primary_agent(_llm1, _llm2, session_id: str):
+def get_primary_agent(_llm1, _llm2, _embedding_model, session_id: str):
     """Get or create primary agent (cached across reruns)."""
     try:
         logger.info(f"Creating primary agent for session: {session_id}")
-        agent = PrimaryAgent(_llm1, _llm2, session_id)
+        agent = PrimaryAgent(_llm1, _llm2, _embedding_model, session_id)
         return agent
     except Exception as e:
         logger.error(f"Failed to initialize agent: {e}")
@@ -182,11 +183,11 @@ def run_streamlit_app():
     
     # Initialize LLM (cached)
     with st.spinner("Loading language model..."):
-        llm1, llm2 = initialize_llm()
+        llm1, llm2, embedding_model = initialize_llm()
         _initialize_langsmith()
     
     # Get agent (cached per session)
-    agent = get_primary_agent(llm1, llm2, st.session_state.session_id)
+    agent = get_primary_agent(llm1, llm1, embedding_model, st.session_state.session_id)
     
     # Sidebar
     with st.sidebar:
@@ -356,13 +357,13 @@ def run_cli():
     session_id = str(uuid.uuid4())
     
     print("Loading language model...")
-    llm1, llm2 = initialize_llm()
+    llm1, llm2, embedding_model = initialize_llm()
     
     print("Initializing langsmith monitoring")
     _initialize_langsmith()
 
     print("Initializing agent...")
-    agent = get_primary_agent(llm1, llm2, session_id)
+    agent = get_primary_agent(llm1, llm1, embedding_model, session_id)
     
     print("Ready to chat!\n")
     

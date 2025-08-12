@@ -40,6 +40,7 @@ dependencies = [
     "pypdf>=5.9.0",
     "unstructured[local-inference]>=0.18.11",
     "langchain-experimental>=0.3.4",
+    "rapidfuzz>=3.13.0",
 ]
 
 [project.optional-dependencies]

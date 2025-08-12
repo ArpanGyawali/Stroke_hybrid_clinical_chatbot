@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     llm_model: str = Field("llama-3.1-8b-instruct", env="LLM_MODEL")
     embedding_model: str = Field("sentence-transformers/all-MiniLM-L6-v2", env="EMBEDDING_MODEL")
     temperature: float = Field(0.1, env="TEMPERATURE")
-    max_tokens: int = Field(512, env="MAX_TOKENS")
+    max_tokens: int = Field(1000, env="MAX_TOKENS")
     
     # Data Paths
     project_root: Path = Path(__file__).parent.parent.parent
@@ -58,7 +58,7 @@ class Settings(BaseSettings):
     column_mappings: dict = {
         "patient_id": ["INSPIRE ID", "Site", "Study ID"],
         "demographics": ["Onset Age", "Gender"],
-        "timing": ["Onset Date/Time", "Onset Date", "Date Last Seen Well", 
+        "timing": ["Onset Date", "Date Last Seen Well", 
                   "Onset Time", "Time Last Seen Well"],
         "clinical_measures": ["Baseline NIHSS", "Baseline Blood Glucose (mmol/L)",
                             "Baseline Systolic Blood Pressure (mmHg)",

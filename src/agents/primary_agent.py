@@ -7,10 +7,11 @@ from datetime import datetime
 from langchain.llms.base import BaseLLM
 from langchain.prompts import PromptTemplate
 from langchain.tools import BaseTool
+from sentence_transformers import SentenceTransformer
 
 from .query_router import QueryRouter, QueryType, QueryAnalysis
 from ..tools.structured_query_tool import StructuredQueryTool
-from ..tools.rag_tool import RAGTool, DomainKnowledgeTool
+from ..tools.rag_tool import RAGTool
 from ..tools.data_loader import DataLoader
 from ..memory.chat_memory import ChatMemoryManager
 from ..config.settings import settings
@@ -21,9 +22,10 @@ logger = logging.getLogger(__name__)
 class PrimaryAgent:
     """Main agent that coordinates all clinical data analysis tasks."""
     
-    def __init__(self, llm1: BaseLLM, llm2: BaseLLM, session_id: str = "default"):
+    def __init__(self, llm1: BaseLLM, llm2: BaseLLM, embedding_model: SentenceTransformer, session_id: str = "default"):
         self.llm1 = llm1
         self.llm2 = llm2
+        self.embedding_model = embedding_model
         self.session_id = session_id
         
         # Initialize components
@@ -41,9 +43,8 @@ class PrimaryAgent:
     def _initialize_tools(self) -> List[BaseTool]:
         """Initialize all available tools."""
         tools = [
-            StructuredQueryTool(self.data_loader, self.llm2),
-            RAGTool(self.data_loader, self.llm1),
-            DomainKnowledgeTool(self.llm1)
+            StructuredQueryTool(self.data_loader, self.llm2, self.embedding_model),
+            RAGTool(self.data_loader, self.llm1, self.embedding_model)
         ]
         
         logger.info(f"Initialized {len(tools)} tools: {[tool.name for tool in tools]}")
@@ -152,27 +153,27 @@ class PrimaryAgent:
                     logger.error(f"Tool not found: {tool_name}")
                     continue
                 
-                # Modify query based on previous results if needed
-                modified_query = self._enhance_query_with_context(query, context_updates)
+                # # Modify query based on previous results if needed
+                # modified_query = self._enhance_query_with_context(query, context_updates)
                 
                 # Execute tool
                 try:
-                    tool_result = await tool._arun(modified_query)
+                    tool_result = await tool._arun(query)
                 except AttributeError:
                     # Fallback to sync execution
-                    tool_result = tool._run(modified_query)
+                    tool_result = tool._run(query)
                 
                 result = {
                     "tool": tool_name,
-                    "query": modified_query,
+                    "query": query,
                     "result": tool_result,
                     "step_info": step,
                     "timestamp": datetime.now().isoformat()
                 }
                 
-                # Update context for next tools
-                if tool_name == "domain_knowledge":
-                    context_updates["domain_knowledge"] = tool_result
+                # # Update context for next tools
+                # if tool_name == "domain_knowledge":
+                #     context_updates["domain_knowledge"] = tool_result
                 
                 results.append(result)
                 logger.info(f"Executed tool: {tool_name}")
@@ -226,19 +227,19 @@ class PrimaryAgent:
             "timestamp": datetime.now().isoformat()
         }
     
-    def _enhance_query_with_context(self, original_query: str, context_updates: Dict[str, str]) -> str:
-        """Enhance query with context from previous tool results."""
-        if not context_updates:
-            return original_query
+    # def _enhance_query_with_context(self, original_query: str, context_updates: Dict[str, str]) -> str:
+    #     """Enhance query with context from previous tool results."""
+    #     if not context_updates:
+    #         return original_query
         
-        enhanced_query = original_query
+    #     enhanced_query = original_query
         
-        # Add domain knowledge context if available
-        if "domain_knowledge" in context_updates:
-            domain_info = context_updates["domain_knowledge"]
-            # Extract column suggestions from domain knowledge
-            if "Suggested database columns" in domain_info:
-                enhanced_query += f"\n\nAdditional context: {domain_info}"
+    #     # Add domain knowledge context if available
+    #     if "domain_knowledge" in context_updates:
+    #         domain_info = context_updates["domain_knowledge"]
+    #         # Extract column suggestions from domain knowledge
+    #         if "Suggested database columns" in domain_info:
+    #             enhanced_query += f"\n\nAdditional context: {domain_info}"
         
         return enhanced_query
     
@@ -249,28 +250,26 @@ class PrimaryAgent:
             synthesis_prompt = PromptTemplate(
                 input_variables=["query", "analysis", "tool_results", "memory_context"],
                 template="""
-You are a clinical AI assistant. Synthesize a comprehensive, accurate response based on the query analysis and tool results.
+                <INSTRUCTION>
+                You are a clinical AI assistant. Synthesize a comprehensive, accurate response based on the query analysis and tool results.
 
-Original Query: {query}
+                Original Query: {query}
 
-Query Analysis: {analysis}
+                Query Analysis: {analysis}
 
-Tool Results:
-{tool_results}
+                Tool Results:
+                {tool_results}
 
-Memory Context: {memory_context}
+                Instructions:
+                - Provide a direct, comprehensive answer to the user's question. 
+                - Integrate information from all relevant tool results. DO NOT miss any result at all.
+                - Ensure medical accuracy and clinical appropriateness. Donot add your own view.
+                - Use clear, professional language accessible to healthcare professionals
+                - If data is incomplete, acknowledge this and suggest next steps
+                </INSTRUCTION>
 
-Instructions:
-1. Provide a direct, comprehensive answer to the user's question
-2. Integrate information from all relevant tool results
-3. Ensure medical accuracy and clinical appropriateness
-4. Explain any limitations or uncertainties
-5. Use clear, professional language accessible to healthcare professionals
-6. If data is incomplete, acknowledge this and suggest next steps
-7. Maintain patient privacy and confidentiality
-
-Response:
-"""
+                <RESPONSE>
+                """
             )
             
             # Format tool results for synthesis
@@ -283,17 +282,18 @@ Response:
                 )
             
             results_text = "\n".join(formatted_results)
-            memory_context = self.memory.get_memory_variables()
+            # memory_context = self.memory.get_memory_variables()
             
             prompt_text = synthesis_prompt.format(
                 query=query,
                 analysis=analysis.dict(),
-                tool_results=results_text,
-                memory_context=str(memory_context)
+                tool_results=results_text
+                # memory_context=str(memory_context)
             )
             
             # Generate synthesized response
             synthesized_answer = self.llm1(prompt_text)
+            synthesized_answer = synthesized_answer.split("</RESPONSE>")[0]
             
             return {
                 "answer": synthesized_answer,
