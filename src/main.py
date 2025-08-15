@@ -1,6 +1,6 @@
 """Main application entry point for the clinical chatbot."""
 
-import os
+import os, sys
 import logging
 import asyncio
 import uuid
@@ -24,9 +24,14 @@ from .tools.data_loader import DataLoader
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),                 # Console output
+        logging.FileHandler("app.log", mode='w', encoding='utf-8')  # File output
+    ]
 )
 logger = logging.getLogger(__name__)
+
 
 class CustomStoppingCriteria(StoppingCriteria):
     def __init__(self, stop_words, tokenizer):
@@ -34,12 +39,9 @@ class CustomStoppingCriteria(StoppingCriteria):
         self.tokenizer = tokenizer
         
     def __call__(self, input_ids, scores, **kwargs):
-        # Decode the last few tokens to check for stop words
-        last_tokens = self.tokenizer.decode(input_ids[0][-20:])
-        for stop_word in self.stop_words:
-            if stop_word in last_tokens:
-                return True
-        return False
+        text = self.tokenizer.decode(input_ids[0], skip_special_tokens=False)
+        return any(stop_word in text for stop_word in self.stop_words)
+    
 
 @st.cache_resource
 def initialize_llm():
@@ -49,43 +51,60 @@ def initialize_llm():
 
         
         # Initialize the Hugging Face LLaMA-3.1 model.
-        model_path = settings.model_dir / settings.llm_model
-        tokenizer = AutoTokenizer.from_pretrained(str(model_path))
+        model1_path = settings.model_dir / settings.llm_model1
+        model2_path = settings.model_dir / settings.llm_model2
 
-        model = AutoModelForCausalLM.from_pretrained(
-            str(model_path),
+        tokenizer1 = AutoTokenizer.from_pretrained(str(model1_path))
+        tokenizer2 = AutoTokenizer.from_pretrained(str(model2_path))
+
+        model1 = AutoModelForCausalLM.from_pretrained(
+            str(model1_path),
             torch_dtype=torch.float16,
             device_map="auto"
             # load_in_4bit=True   # Saves VRAM, optional
         )
 
-        # Create stopping criteria
-        stop_words = ["</CODE>", "</RESPONSE>"]
-        stopping_criteria = StoppingCriteriaList([CustomStoppingCriteria(stop_words, tokenizer)])
+        model2 = AutoModelForCausalLM.from_pretrained(
+            str(model2_path),
+            torch_dtype=torch.float16,
+            device_map="auto",
+            trust_remote_code=True
+            # load_in_4bit=True   # Saves VRAM, optional
+        )
 
-        pipe = pipeline(
+
+        # Create stopping criteria
+        stop_words = ["</CODE_5348_TAG>", "</RESPONSE_5348_TAG>"]
+        stopping_criteria1 = StoppingCriteriaList([CustomStoppingCriteria(stop_words, tokenizer1)])
+        stopping_criteria2 = StoppingCriteriaList([CustomStoppingCriteria(stop_words, tokenizer2)])
+        pipe1 = pipeline(
             "text-generation",
-            model=model,
-            tokenizer=tokenizer,
+            model=model1,
+            tokenizer=tokenizer1,
             max_new_tokens=settings.max_tokens,
             temperature=settings.temperature,
             top_p=0.9,
-            pad_token_id=tokenizer.eos_token_id,
-            stopping_criteria=stopping_criteria,
+            pad_token_id=tokenizer1.eos_token_id,
+            stopping_criteria=stopping_criteria1,
             return_full_text=False,  # Critical: only return new tokens
             repetition_penalty=1.1   # Prevent repetition
         )
 
         pipe2 = pipeline(
-            "question-answering",
-            model=model,
-            tokenizer=tokenizer,
+            "text-generation",
+            model=model2,
+            tokenizer=tokenizer2,
             max_new_tokens=settings.max_tokens,
             temperature=settings.temperature,
-            top_p=0.9
+            top_p=0.9,
+            pad_token_id=tokenizer2.eos_token_id,
+            stopping_criteria=stopping_criteria2,
+            return_full_text=False,
+            repetition_penalty=1.1
         )
 
-        llm = HuggingFacePipeline(pipeline=pipe)
+
+        llm1 = HuggingFacePipeline(pipeline=pipe1)
         llm2 = HuggingFacePipeline(pipeline=pipe2)
         # llm = OpenAILLM(
         #     api_key=settings.openai_api_key,
@@ -95,8 +114,8 @@ def initialize_llm():
         #     top_p=0.9,
         # )
         embedding_model = SentenceTransformer(settings.embedding_model)
-        logger.info(f"LLM and embedding model nitialized successfully: {settings.llm_model} {settings.embedding_model}")
-        return llm, llm2, embedding_model
+        logger.info(f"LLM and embedding model nitialized successfully: {settings.llm_model1} and {settings.llm_model2} and {settings.embedding_model}")
+        return llm1, llm2, embedding_model
         
     except Exception as e:
         logger.error(f"Failed to initialize LLM: {e}")
@@ -187,7 +206,7 @@ def run_streamlit_app():
         _initialize_langsmith()
     
     # Get agent (cached per session)
-    agent = get_primary_agent(llm1, llm1, embedding_model, st.session_state.session_id)
+    agent = get_primary_agent(llm1, llm2, embedding_model, st.session_state.session_id)
     
     # Sidebar
     with st.sidebar:
@@ -363,7 +382,7 @@ def run_cli():
     _initialize_langsmith()
 
     print("Initializing agent...")
-    agent = get_primary_agent(llm1, llm1, embedding_model, session_id)
+    agent = get_primary_agent(llm1, llm2, embedding_model, session_id)
     
     print("Ready to chat!\n")
     

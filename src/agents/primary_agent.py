@@ -1,6 +1,6 @@
 """Primary agent that orchestrates the entire clinical query processing pipeline."""
 
-import logging
+import logging, sys
 import asyncio
 from typing import List, Dict, Any, Optional
 from datetime import datetime
@@ -16,6 +16,15 @@ from ..tools.data_loader import DataLoader
 from ..memory.chat_memory import ChatMemoryManager
 from ..config.settings import settings
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),                 # Console output
+        logging.FileHandler("app.log", mode='a', encoding='utf-8')  # File output
+    ]
+)
 logger = logging.getLogger(__name__)
 
 
@@ -33,12 +42,13 @@ class PrimaryAgent:
         self.memory = ChatMemoryManager(llm1, session_id)
         self.query_router = QueryRouter(llm1)
         
-        # Initialize tools
-        self.tools = self._initialize_tools()
-        self.tool_map = {tool.name: tool for tool in self.tools}
         
         # Load data
         self._load_initial_data()
+        
+        # Initialize tools
+        self.tools = self._initialize_tools()
+        self.tool_map = {tool.name: tool for tool in self.tools}
     
     def _initialize_tools(self) -> List[BaseTool]:
         """Initialize all available tools."""
@@ -249,27 +259,37 @@ class PrimaryAgent:
             # Prepare synthesis prompt
             synthesis_prompt = PromptTemplate(
                 input_variables=["query", "analysis", "tool_results", "memory_context"],
-                template="""
-                <INSTRUCTION>
-                You are a clinical AI assistant. Synthesize a comprehensive, accurate response based on the query analysis and tool results.
+                template = """
+                    <ROLE>
+                    You are a clinical AI assistant. Your task is to synthesize a comprehensive, accurate response based on the query analysis and tool results.
+                    </ROLE>
 
-                Original Query: {query}
+                    <Original Query>
+                    {query}
+                    </Original Query>
 
-                Query Analysis: {analysis}
+                    <Query Analysis>
+                    {analysis}
+                    </Query Analysis>
 
-                Tool Results:
-                {tool_results}
+                    <Tool Results>
+                    {tool_results}
+                    </Tool Results>
 
-                Instructions:
-                - Provide a direct, comprehensive answer to the user's question. 
-                - Integrate information from all relevant tool results. DO NOT miss any result at all.
-                - Ensure medical accuracy and clinical appropriateness. Donot add your own view.
-                - Use clear, professional language accessible to healthcare professionals
-                - If data is incomplete, acknowledge this and suggest next steps
-                </INSTRUCTION>
+                    <INSTRUCTIONS>
+                    - Provide a direct, comprehensive answer to the user's question. Donot hallucinate.
+                    - Integrate information from ALL relevant tool results without omitting anything. Donot miss any information
+                    - Maintain medical accuracy and clinical appropriateness; do NOT add personal opinions or external knowledge.
+                    - For hybrid query, based on the query order combine the answers from the tools in the same order.
+                    - If the query requests changes or modifications to the structured data, state clearly that such actions are not permitted and the user has no write access.
+                    - Use clear, professional language accessible to healthcare professionals. Donot add any other information by yourself.
+                    - If the available data is incomplete, explicitly acknowledge this and suggest next steps.
+                    - For structured data query tool, give exact answer and use tables when necessary.
+                    - If rag search tool is used, dont forgot to mention source of the information and keep the answer concise and structured with short paragraphs, bullet points.
+                    </INSTRUCTIONS>
 
-                <RESPONSE>
-                """
+                    <RESPONSE_5348_TAG>
+                    """
             )
             
             # Format tool results for synthesis
@@ -293,7 +313,7 @@ class PrimaryAgent:
             
             # Generate synthesized response
             synthesized_answer = self.llm1(prompt_text)
-            synthesized_answer = synthesized_answer.split("</RESPONSE>")[0]
+            synthesized_answer = synthesized_answer.split("</RESPONSE_5348_TAG>")[0]
             
             return {
                 "answer": synthesized_answer,

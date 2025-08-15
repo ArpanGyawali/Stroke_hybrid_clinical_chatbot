@@ -1,6 +1,6 @@
 """Data loading utilities for structured and unstructured data."""
 
-import logging
+import logging, sys
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 import pandas as pd
@@ -15,6 +15,15 @@ from langchain_experimental.text_splitter import SemanticChunker
 
 from ..config.settings import settings
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),                 # Console output
+        logging.FileHandler("app.log", mode='a', encoding='utf-8')  # File output
+    ]
+)
 logger = logging.getLogger(__name__)
 
 
@@ -28,6 +37,7 @@ class DataLoader:
             model_name=settings.embedding_model,
             model_kwargs={'device': 'cpu'}
         )
+        self.collection_already_populated = False  # Default until checked
         self._initialize_weaviate()
     
     def __enter__(self):
@@ -46,63 +56,62 @@ class DataLoader:
         """Initialize Weaviate client and create collection if needed."""
         try:
             headers = {}
-            if hasattr(settings, 'huggingface_api_key') and settings.huggingface_api_key:
+            if getattr(settings, 'huggingface_api_key', None):
                 headers["X-HuggingFace-Api-Key"] = settings.huggingface_api_key
-            
+
             self.weaviate_client = weaviate.connect_to_weaviate_cloud(
                 cluster_url=settings.weaviate_url,
                 auth_credentials=weaviate.auth.AuthApiKey(settings.weaviate_api_key),
                 headers=headers if headers else None
             )
-            
-            # Wait for client to be ready
+
             if not self.weaviate_client.is_ready():
                 logger.warning("Weaviate client is not ready, waiting...")
-            
-            # Create collection if it doesn't exist
-            if not self.weaviate_client.collections.exists(settings.collection_name):
-                # Use a well-tested HuggingFace model for embedding
+
+            collections = self.weaviate_client.collections
+            if collections.exists(settings.collection_name):
+                collection = collections.get(settings.collection_name)
+
+                # Check if collection already has data
+                count_result = collection.aggregate.over_all(total_count=True)
+                total_count = getattr(count_result, "total_count", 0)
+
+                if total_count and total_count > 0:
+                    logger.info(f"Collection '{settings.collection_name}' already exists with {total_count} objects. Skipping data load.")
+                    self.collection_already_populated = True
+                    return
+                else:
+                    logger.info(f"Collection '{settings.collection_name}' exists but is empty. Will load data.")
+                    self.collection_already_populated = False
+            else:
+                logger.info(f"Collection '{settings.collection_name}' does not exist. Creating it.")
                 vectorizer_config = Configure.Vectorizer.text2vec_huggingface(
                     model=settings.embedding_model
                 )
-                
-                self.weaviate_client.collections.create(
+                collections.create(
                     name=settings.collection_name,
                     vectorizer_config=vectorizer_config,
                     properties=[
-                        Property(
-                            name="content",
-                            data_type=DataType.TEXT,
-                            description="Document content"
-                        ),
-                        Property(
-                            name="source",
-                            data_type=DataType.TEXT,
-                            description="Document source path"
-                        ),
-                        Property(
-                            name="document_type",
-                            data_type=DataType.TEXT,
-                            description="Type of document (pdf, text, etc.)"
-                        ),
+                        Property(name="content", data_type=DataType.TEXT, description="Document content"),
+                        Property(name="source", data_type=DataType.TEXT, description="Document source path"),
+                        Property(name="document_type", data_type=DataType.TEXT, description="Type of document (pdf, text, etc.)"),
                     ]
                 )
-                logger.info(f"Created collection: {settings.collection_name}")
-            else:
-                logger.info(f"Collection {settings.collection_name} already exists")
-                
+                self.collection_already_populated = False
+
         except Exception as e:
             logger.error(f"Failed to initialize Weaviate: {e}")
             raise
+
     
     def load_structured_data(self, file_path: Optional[Path] = None) -> pd.DataFrame:
         """Load structured data from CSV/Excel files"""
         if file_path is None:
             # Search for Excel and CSV files
-            excel_files = list(settings.structured_data_dir.glob("*.xlsx")) + list(settings.structured_data_dir.glob("*.xls"))
+            # excel_files = list(settings.structured_data_dir.glob("*.xlsx")) + list(settings.structured_data_dir.glob("*.xls"))
             csv_files = list(settings.structured_data_dir.glob("*.csv"))
             
-            all_files = excel_files + csv_files
+            all_files =  csv_files
             
             if not all_files:
                 raise FileNotFoundError("No Excel or CSV files found in structured data directory")
@@ -111,9 +120,9 @@ class DataLoader:
 
         try:
             if file_path.suffix.lower() == '.csv':
-                self.structured_data = pd.read_csv(file_path)
-            elif file_path.suffix.lower() in ['.xlsx', '.xls']:
-                self.structured_data = pd.read_excel(file_path)
+                self.structured_data = pd.read_csv(file_path, low_memory=False)
+            # elif file_path.suffix.lower() in ['.xlsx', '.xls']:
+            #     self.structured_data = pd.read_excel(file_path)
             else:
                 raise ValueError(f"Unsupported file format: {file_path.suffix}")
 
@@ -197,6 +206,10 @@ class DataLoader:
         
         if not documents:
             logger.warning("No documents to index")
+            return
+        
+        if self.collection_already_populated is True:
+            logger.info("Collection already populated. Skipping indexing.")
             return
         
         collection = self.weaviate_client.collections.get(settings.collection_name)

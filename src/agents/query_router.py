@@ -1,6 +1,6 @@
 """Query router to determine which tools/agents to use based on the query."""
 
-import logging
+import logging, sys
 from typing import List, Dict, Any, Tuple
 from enum import Enum
 
@@ -9,6 +9,15 @@ from langchain.prompts import PromptTemplate
 from pydantic import BaseModel
 from ..config.settings import settings
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),                 # Console output
+        logging.FileHandler("app.log", mode='a', encoding='utf-8')  # File output
+    ]
+)
 logger = logging.getLogger(__name__)
 
 
@@ -55,47 +64,55 @@ class QueryRouter:
             input_variables=["query", "memory_context", "structured_patterns",
                              "unstructured_patterns"],
             template = """
-            <INSTRUCTION>
-            You are a clinical AI query router.
+                <ROLE>
+                You are a clinical AI query router. Your task is to classify the query given.
+                </ROLE>
 
-            Data sources:
-            1. Structured clinical data: patient tables (Excel/CSV) with measurements, outcomes, demographics.
-            2. Unstructured clinical docs: PDFs, research papers, guidelines, clinical notes.
+                <Data Sources>
+                1. Structured clinical data: patient tables (Excel/CSV) containing patient-level information such as measurements, lab results, outcomes, and demographics.
+                2. Unstructured clinical documents: PDFs, research papers, clinical guidelines, journal articles, and free-text clinical notes.
+                </Data Sources>
 
-            Structured indicators: {structured_patterns}
-            Unstructured indicators: {unstructured_patterns}
+                <Structured Indicators>
+                {structured_patterns}
+                </Structured Indicators>
 
-            Query: {query}
-            Context: {memory_context}
+                <Unstructured Indicators>
+                {unstructured_patterns}
+                </Unstructured Indicators>
 
-            Classify and plan:
-            - QUERY_TYPE: One of [structured_only, unstructured_only, hybrid, unclear]
-            - CONFIDENCE: 0–1
-            - STRUCTURED_COMPONENTS: list of structured elements to extract
-            - UNSTRUCTURED_COMPONENTS: list of unstructured info to retrieve
-            - REASONING: short explanation of why (2-4 sentences)
+                <Query>
+                {query}
+                </Query>
 
-            Examples:
-            Q: "When did the symptom start for patient INSP_AU010031?"
-            → QUERY_TYPE: structured_only
+                <Context>
+                {memory_context}
+                </Context>
 
-            Q: "What are the treatments for hypodense stroke?"
-            → QUERY_TYPE: unstructured_only
+                <INSTRUCTIONS>
+                - Your goal is to determine whether the query should be answered from structured data, unstructured data, both, or if it is unclear.
+                - Output QUERY_TYPE as one of: [structured_only, unstructured_only, hybrid, unclear].
+                - If the query contains multiple distinct questions separated by punctuation (e.g., ".", "?", ";"), classify and analyze each separately.
+                - If the query refers to a specific clinical trial, research paper, journal article, published study, or guideline documents, classify this part as unstructured  — even if similar data fields exist in structured data.
+                - Structured queries are generally includes counts, calculations, aggregation, comparisions, filtering,  Time-based queries, etc on patient level structured data.
+                - Hybrid applies only when the answer requires combining both structured patient data and unstructured document content.
+                - Assign a CONFIDENCE score between 0 and 1 for your classification.
+                - List relevant STRUCTURED_COMPONENTS to extract from structured data (empty list if none).
+                - List relevant UNSTRUCTURED_COMPONENTS to retrieve from unstructured data (empty list if none).
+                - Provide a short REASONING (2–4 sentences) explaining your decision without restating the instructions or query.
+                - Respond in exactly the format shown below — no extra commentary or rephrasing.
 
-            Q: "How many patients had hypodense stroke and what are the ways to identify it?"
-            → QUERY_TYPE: hybrid
+                <Response format>
+                QUERY_TYPE: ...
+                CONFIDENCE: ...
+                STRUCTURED_COMPONENTS: [...]
+                UNSTRUCTURED_COMPONENTS: [...]
+                REASONING: ...
+                </Response format>
 
-            Respond in exactly this format:
+                <RESPONSE_5348_TAG>
+                """
 
-            QUERY_TYPE: ...
-            CONFIDENCE: ...
-            STRUCTURED_COMPONENTS: [...]
-            UNSTRUCTURED_COMPONENTS: [...]
-            REASONING: ...
-            </INSTRUCTION>
-
-            <RESPONSE>
-            """
             )
 
     
@@ -114,7 +131,7 @@ class QueryRouter:
             )
 
             analysis_text = self.llm(prompt_text)
-            analysis_text = analysis_text.split("</RESPONSE>")[0]
+            analysis_text = analysis_text.split("</RESPONSE_5348_TAG>")[0]
             analysis = self._parse_analysis(analysis_text, query)
 
             # Inject preprocessed info
