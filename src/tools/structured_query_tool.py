@@ -13,7 +13,7 @@ import io, sys, traceback
 import textwrap
 from rapidfuzz import fuzz
 from sentence_transformers import SentenceTransformer, util
-
+from datetime import datetime, date
 
 from .data_loader import DataLoader
 from ..config.settings import settings
@@ -104,14 +104,18 @@ class StructuredQueryTool(BaseTool):
                     - Focus only on the relevant columns provided — use these columns for the code.
                     - If asked for patient in the query, use `INSPIRE ID` as the patient ID.
                     - Always store the final result in a variable called `result`.
-                    - Use boolean indexing `df[df['column_name'] == value]` for filtering and only return the relevent column eg:`result = df[(df["relevant_column"] == value)][["INSPIRE ID", "relavent columns"]]`
+                    - Use boolean indexing `df[df['column_name'] == value]` for filtering and only return the relevent column eg:`result = df[(df["relevant_column"] == value)][["INSPIRE ID", "relavent columns"]]`.
+                    - All string values in the data except for the column names are lower case, so while filtering use the lower case in the value, but dont use lower case for column_name.
+                    - Consider the 'example' values in the provided relevant column information while filtering. wg: If the example value is [nan, 'Yes', 'No'], Instead of filtering using df['column_name'] == True, use the example value as df['column_name'] == 'Yes'.
                     - Always exclude missing values before ANY calculation or filtering:
                         * For numeric operations: use `pd.to_numeric(df['column_name'], errors='coerce')` before comparison and drop missing values.
                         * For string operations: use `df['column_name'].str.contains(..., na=False)` or `df['column_name'].notna()` before applying string methods.
-                        * For boolean operations: use `df['column_name'].notna()` before comparison (e.g., `df[df['column_name'].notna() & (df['column_name'] == True)]`).
+                        * For boolean operations: use `df['column_name'].notna()` before comparison (e.g., `df[df['column_name'].notna() & (df['column_name'] == True)]`). 
                         * For datetime operations: use `pd.to_datetime(df['column_name'], errors='coerce')` before comparison, then drop missing values.
+                        * Note: While removing missing value, remove it first and then only use filtering or comparisions so that boolean mask keeps the same index.
+                    - For comparisons between multiple columns: First filter for rows where ALL relevant columns have valid (non-null) values using `df[df['column1'].notna() & df['column2'].notna()]` before performing calculations or comparisons between those columns.
                     - Write clean, error-free code with proper syntax.
-                    - Do NOT write code that modifies the data (no write access).
+                    - Do NOT write code that modifies the data (no write access) and also donot save/write any intermediate file.
                     - Generate only the Python code without any explanation, comments, or extra text.
                     - Do not repeat or rephrase the question, instructions, or context. Just output the code.
                     </INSTRUCTIONS>
@@ -208,7 +212,139 @@ class StructuredQueryTool(BaseTool):
         
         return '\n'.join(final_lines)
     
+    def generate_column_info(self, df: pd.DataFrame) -> str:
+        """
+        Generate concise column information for preprocessed DataFrame.
+        Returns: column_name, type, missing_percentage, unique_count, and range/examples
+        """
+        column_info = []
         
+        for col in df.columns:
+            info = {"column_name": col}
+            
+            # Get clean data excluding empty, None, and NaN values
+            mask = (
+                (df[col] != '') & 
+                (df[col] != 'None') & 
+                (df[col] != 'none') &
+                (df[col].notna()) &
+                (df[col] != 'nan') &
+                (df[col] != 'null')
+            )
+            
+            clean_data = df[col][mask]
+            total_rows = len(df)
+            clean_count = len(clean_data)
+            
+            # Basic info
+            missing_count = total_rows - clean_count
+            info["missing_percentage"] = round((missing_count / total_rows) * 100, 2) if total_rows > 0 else 0
+            
+            # Type detection
+            if clean_count == 0:
+                info["type"] = "empty"
+                info["unique_count"] = 0
+                info["examples"] = []
+            else:
+                unique_values = clean_data.unique()
+                info["unique_count"] = len(unique_values)
+                
+                # 1. Check if already numeric (from preprocessing)
+                if clean_data.dtype in ['int64', 'float64', 'int32', 'float32']:
+                    info["type"] = "numeric"
+                else:
+                    # 2. Try numeric detection
+                    numeric_vals = pd.to_numeric(clean_data, errors='coerce')
+                    numeric_success_rate = numeric_vals.notna().mean()
+                    
+                    if numeric_success_rate > 0.80:
+                        info["type"] = "numeric"
+                    else:
+                        # 3. DateTime detection - check for date objects first
+                        if any(isinstance(val, date) and not isinstance(val, str) for val in clean_data.head(10) if pd.notna(val)):
+                            info["type"] = "datetime"
+                        else:
+                            datetime_success_rate = 0
+                            try:
+                                # Only try string parsing if we don't have date objects
+                                datetime_vals = pd.to_datetime(clean_data, errors='coerce')
+                                datetime_success_rate = datetime_vals.notna().mean()
+                                    
+                            except Exception:
+                                datetime_success_rate = 0
+                            
+                            if datetime_success_rate > 0.70:
+                                info["type"] = "datetime"
+                            else:
+                                # 4. Boolean detection
+                                unique_clean_lower = pd.Series([str(val).lower().strip() for val in unique_values if pd.notna(val)])
+                                unique_clean_lower = unique_clean_lower.unique()
+                                
+                                boolean_values = {'yes', 'no', 'true', 'false', '1', '0', 'y', 'n', 't', 'f'}
+                                
+                                if (len(unique_clean_lower) <= 4 and 
+                                    len(unique_clean_lower) > 0 and
+                                    all(val in boolean_values for val in unique_clean_lower)):
+                                    info["type"] = "boolean"
+                                else:
+                                    # 5. Categorical vs Text
+                                    uniqueness_ratio = info["unique_count"] / clean_count
+                                    if uniqueness_ratio > 0.70 and info["unique_count"] > 10:
+                                        info["type"] = "text"
+                                    else:
+                                        info["type"] = "categorical"
+                
+                # Add type-specific range or examples
+                if info["type"] == "numeric":
+                    try:
+                        if clean_data.dtype not in ['int64', 'float64', 'int32', 'float32']:
+                            numeric_vals = pd.to_numeric(clean_data, errors='coerce').dropna()
+                        else:
+                            numeric_vals = clean_data.dropna()
+                        
+                        if len(numeric_vals) > 0:
+                            min_val = float(numeric_vals.min())
+                            max_val = float(numeric_vals.max())
+                            info["range"] = f"{min_val} to {max_val}"
+                        else:
+                            info["range"] = "No valid values"
+                    except Exception:
+                        info["examples"] = list(unique_values[:5])
+                
+                elif info["type"] == "datetime":
+                    try:
+                        # Handle date objects directly
+                        date_objects = [val for val in clean_data if isinstance(val, date) and not isinstance(val, str)]
+                        if date_objects:
+                            min_date = min(date_objects).strftime('%Y-%m-%d')
+                            max_date = max(date_objects).strftime('%Y-%m-%d')
+                            info["range"] = f"{min_date} to {max_date}"
+                        else:
+                            # Handle string dates as fallback
+                            try:
+                                date_vals = pd.to_datetime(clean_data, errors='coerce')
+                                valid_dates = date_vals.dropna()
+                                
+                                if len(valid_dates) > 0:
+                                    min_date = valid_dates.min().strftime('%Y-%m-%d')
+                                    max_date = valid_dates.max().strftime('%Y-%m-%d')
+                                    info["range"] = f"{min_date} to {max_date}"
+                                else:
+                                    info["range"] = "No valid dates"
+                            except:
+                                info["range"] = "Error parsing dates"
+                    except Exception:
+                        info["examples"] = list(unique_values[:5])
+                
+                else:
+                    # For categorical, boolean, text - show examples
+                    sample_size = min(10, info["unique_count"])
+                    info["examples"] = list(unique_values[:sample_size])
+            
+            column_info.append(info)
+        
+        return column_info
+
     def find_query_column_matched(self, query: list[str], clinical_synonyms: dict, df: pd.DataFrame) -> str:
         """
         Analyzes DataFrame columns and identifies the most relevant ones for a given query.
@@ -217,72 +353,7 @@ class StructuredQueryTool(BaseTool):
         columns, returning formatted column information strings for further processing.
         """
         try:
-            column_info = []
-            for col in df.columns:
-                info = {"column_name": col}
-                # Get data excluding 'Not Available' for type inference
-                clean_data = df[col][(df[col] != '') & (df[col] != 'None')]
-                # Determine actual data type from clean data
-                if len(clean_data) > 0:
-                    # Try numeric detection
-                    numeric_vals = pd.to_numeric(clean_data, errors='coerce')
-                    if numeric_vals.notna().mean() > 0.50:  # 95%+ numeric
-                        info["type"] = "numeric"
-                    else:
-                        # Try datetime detection with explicit format guessing
-                        try:
-                            datetime_vals = pd.to_datetime(
-                                clean_data, 
-                                format="%Y-%m-%d",  # adjust to your known format
-                                errors='coerce'
-                            )
-                        except Exception:
-                            # fallback if format doesn't match
-                            datetime_vals = pd.to_datetime(clean_data, errors='coerce')
-
-                        if datetime_vals.notna().mean() > 0.50:  # >50% valid datetime
-                            info["type"] = "datetime"
-                        else:
-                            # Boolean detection
-                            unique_clean = pd.Series(clean_data.dropna().unique()).astype(str).str.lower()
-                            if len(unique_clean) <= 3 and unique_clean.isin(['yes', 'no', 'true', 'false', '1', '0']).all():
-                                info["type"] = "boolean"
-                            else:
-                                info["type"] = "categorical"
-                else:
-                    info["type"] = "unknown"
-
-                
-                info["Missing count"] = len(df[df[col] == ''])
-                info["unique value"] = len(clean_data.unique()) if len(clean_data) > 0 else 0
-
-                # Add sample values for categorical/string columns, excluding 'Not Available'
-                if info["type"] in ['categorical', 'boolean'] or info["unique value"] < 15:
-                    if len(clean_data) > 0:
-                        sample_vals = clean_data.unique()[:5]
-                        info["example"] = {tuple(sample_vals)}
-                elif info["type"] == 'numeric' and len(clean_data) > 0:
-                    # For numeric, show range instead of examples
-                    try:
-                        numeric_vals = pd.to_numeric(clean_data)
-                        min_val = numeric_vals.min()
-                        max_val = numeric_vals.max()
-                        info["range"] = f"{min_val} to {max_val}"
-                    except:
-                        sample_vals = clean_data.unique()[:5]
-                        info["example"] = {tuple(sample_vals)}
-                elif info["type"] == 'datetime' and len(clean_data) > 0:
-                    # For datetime, show date range
-                    try:
-                        date_vals = pd.to_datetime(clean_data)
-                        min_date = date_vals.min().strftime('%Y-%m-%d') if pd.notna(date_vals.min()) else 'N/A'
-                        max_date = date_vals.max().strftime('%Y-%m-%d') if pd.notna(date_vals.max()) else 'N/A'
-                        info["range"] = f"{min_date} to {max_date}"
-                    except:
-                        sample_vals = clean_data.unique()[:3]
-                        info["example"] = {tuple(sample_vals)}
-                
-                column_info.append(info)
+            column_info = self.generate_column_info(df)
 
             # Generate pandas code to answer the query
             relevent_column_generation_prompt = PromptTemplate(
@@ -310,9 +381,11 @@ class StructuredQueryTool(BaseTool):
                         * Clinical synonyms and medical terminology variations
                         * Common abbreviations and alternative spellings
                         * Semantic relationships between terms
-                    - Consider data types, value ranges, and examples when assessing relevance.
+                        * Matching terms to the column names
+                    - Before finding relavent column, properly consider the types, range and examples and check weather it relate with the question. 
+                    - Looking datatype for relavance Eg: if query is related to date of onset, use "Onset Date" column with type [datetime] instead of "Onset Date/Time" which is [categorical] 
                     - Prioritize columns that directly address the query's intent.
-                    - Return ONLY the relevant column information exactly in the format shown above (list of dict).
+                    - Return ONLY the relevant column information exactly in the format shown above (list of dict). Dont miss out any relevant column to list.
                     - If the query is asking about a patient, then `INSPIRE ID` should also be considered relevant.
                     - Preserve all spaces, punctuation, and parentheses exactly as they appear.
                     - Do not include explanations, code, or additional text.
